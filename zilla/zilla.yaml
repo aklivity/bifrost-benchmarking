@@ -1,0 +1,44 @@
+# Zilla as an OpenAI-compatible gateway in front of the mocker, the counterpart
+# of a Bifrost setup with one OpenAI provider whose base URL is the mocker.
+#
+#   POST /v1/chat/completions (model gpt-*) -> openai upstream at MOCKER_URL
+#
+# No API key is required from the caller: benchmark.go sends no Authorization
+# header to gateways, and the mocker accepts requests without one.
+name: benchmark
+bindings:
+  north_tcp_server:
+    type: tcp
+    kind: server
+    options:
+      host: 0.0.0.0
+      port: 7161
+    exit: north_http_server
+  north_http_server:
+    type: http
+    kind: server
+    exit: north_llm_server
+  north_llm_server:
+    type: llm
+    kind: server
+    options:
+      dialect: openai
+    exit: north_llm_proxy
+  north_llm_proxy:
+    type: llm
+    kind: proxy
+    routes:
+      - when:
+          - model: [ "gpt-*" ]
+        exit: south_llm_client_openai
+  south_llm_client_openai:
+    type: llm
+    kind: client
+    options:
+      dialect: openai
+      server: ${{env.MOCKER_URL}}
+    exit: sys:http_client
+telemetry:
+  exporters:
+    stdout_logs_exporter:
+      type: stdout

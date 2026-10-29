@@ -6,8 +6,9 @@ Benchmarking and load-testing tools for [Bifrost](https://github.com/maximhq/bif
 
 | Tool | What it is | Use it when you want to |
 | --- | --- | --- |
-| [`benchmark.go`](#gateway-benchmark-benchmarkgo) (this directory) | Gateway comparison benchmark built on Vegeta | Compare Bifrost against LiteLLM, Portkey, or raw OpenAI — latency percentiles, throughput, and server memory usage |
+| [`benchmark.go`](#gateway-benchmark-benchmarkgo) (this directory) | Gateway comparison benchmark built on Vegeta | Compare Bifrost against LiteLLM, Portkey, Zilla, or raw OpenAI — latency percentiles, throughput, and server memory usage |
 | [`hitter/`](hitter/README.md) | Standalone load generator for chat completions | Load-test a single Bifrost deployment with realistic traffic: multiple models/providers, streaming, virtual keys, PDF attachments |
+| [`zilla/`](zilla/README.md) | Zilla gateway config and Docker Compose file | Run Zilla in front of the mocker so `benchmark.go` can compare it with Bifrost |
 | [`mocker/`](mocker/README.md) | Mock LLM provider server (fasthttp) | Simulate OpenAI / Anthropic / Gemini / Bedrock endpoints with configurable latency, failures, and rate limits — no API costs, no provider noise |
 | [`mcp-code-mode-benchmark/`](mcp-code-mode-benchmark/README.md) | MCP Code Mode benchmark (Python) | Reproduce our token/latency/pass-rate numbers for [Bifrost's MCP Code Mode](https://docs.getbifrost.ai/mcp/code-mode) |
 | [`model-routing-benchmark/`](model-routing-benchmark/README.md) | Bifrost model-routing benchmarks | Compare fixed Opus 5.5, Bifrost JEV, LiteLLM heuristic v2, and Bifrost semantic routing on Terminal-Bench 2.1 and RouterArena |
@@ -46,6 +47,7 @@ Setup details, performance tuning (concurrency, buffer and pool sizes), and Dock
 BIFROST_PORT=8080
 LITELLM_PORT=4000
 PORTKEY_PORT=8787
+ZILLA_PORT=7161     # see zilla/README.md
 OPENAI_API_KEY=sk-...   # only needed for the openai/portkey providers
 ```
 
@@ -71,7 +73,8 @@ A command-line tool that fires load at one or more gateways and records latency 
 | `-timeout` | int | 300 | Request timeout in seconds (set to duration + expected backend latency) |
 | `-output` | string | results.json | Output file for results |
 | `-cooldown` | int | 60 | Cooldown between provider tests in seconds |
-| `-provider` | string | "" | Provider to benchmark: `bifrost`, `litellm`, `portkey`, or `openai`. **Empty runs all four** |
+| `-warmup` | int | 0 | Seconds of traffic at `-rate` sent before each provider test and left out of its results (only with `-rate`) |
+| `-provider` | string | "" | Provider to benchmark: `bifrost`, `litellm`, `portkey`, `zilla`, or `openai`. **Empty runs all five** |
 | `-big-payload` | bool | false | Use a ~10KB payload instead of the ~200B default |
 | `-model` | string | gpt-4o-mini | Model to put in the request payload |
 | `-suffix` | string | v1 | URL route suffix (e.g. `v1`) |
@@ -127,7 +130,7 @@ A command-line tool that fires load at one or more gateways and records latency 
 
 ### Payloads
 
-`chat` requests look like `{"messages":[{"role":"user","content":"<prompt>"}],"model":"openai/<model>"}`; `embedding` requests use `{"input":"<prompt>","model":"openai/<model>"}` (the raw OpenAI provider drops the `openai/` prefix). The request index and timestamp are prepended to every prompt to defeat prompt caching. With `-prompt-file`, the whole file becomes the prompt — `10kbprompt.txt` and `50kbprompt.txt` in the repo root are ready-made fixtures. Portkey requests automatically get an `x-portkey-config` header carrying your OpenAI key.
+`chat` requests look like `{"messages":[{"role":"user","content":"<prompt>"}],"model":"openai/<model>"}`; `embedding` requests use `{"input":"<prompt>","model":"openai/<model>"}` (the raw OpenAI provider drops the `openai/` prefix). Each message is serialized `role` before `content` (Zilla requires that order). The request index and timestamp are prepended to every prompt to defeat prompt caching. With `-prompt-file`, the whole file becomes the prompt — `10kbprompt.txt` and `50kbprompt.txt` in the repo root are ready-made fixtures. Portkey requests automatically get an `x-portkey-config` header carrying your OpenAI key.
 
 ### Output
 
@@ -167,6 +170,7 @@ benchmark.go              # gateway comparison benchmark (documented above)
 pkg/concurrent/           # semaphore-based concurrency engine for -users mode
 hitter/                   # load generator for Bifrost — see hitter/README.md
 mocker/                   # mock LLM provider server — see mocker/README.md
+zilla/                    # Zilla gateway config for benchmark.go — see zilla/README.md
 mcp-code-mode-benchmark/  # MCP Code Mode benchmark — see its README.md
 model-routing-benchmark/  # model-routing reports and runners, organized by benchmark
   terminal-bench/         # Terminal-Bench 2.1 results and 77-task runner

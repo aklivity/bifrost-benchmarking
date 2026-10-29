@@ -77,7 +77,8 @@ func main() {
 	timeout := flag.Int("timeout", 300, "Request timeout in seconds (should be duration + expected backend latency)")
 	outputFile := flag.String("output", "results.json", "Output file for results")
 	cooldown := flag.Int("cooldown", 60, "Cooldown period between tests in seconds")
-	provider := flag.String("provider", "", "Specific provider to benchmark (bifrost, litellm, portkey, openai)")
+	warmup := flag.Int("warmup", 0, "Warm-up period in seconds before each test, sent at --rate and left out of the results (only with --rate)")
+	provider := flag.String("provider", "", "Specific provider to benchmark (bifrost, litellm, portkey, zilla, openai)")
 	bigPayload := flag.Bool("big-payload", false, "Use a bigger payload")
 	model := flag.String("model", "gpt-4o-mini", "Model to use")
 	maxOutputTokens := flag.Int("max-output-tokens", 0, "Max output tokens for chat requests. Defaults to 3000 with --big-payload and is omitted otherwise")
@@ -99,6 +100,13 @@ func main() {
 	}
 	if *rate == 0 && *users == 0 {
 		log.Fatalf("Either --rate or --users flag must be provided.")
+	}
+
+	if *warmup < 0 {
+		log.Fatalf("--warmup cannot be negative")
+	}
+	if *warmup > 0 && *rate == 0 {
+		log.Fatalf("--warmup can only be used with --rate flag.")
 	}
 
 	// Validate ramp-up flags
@@ -155,7 +163,7 @@ func main() {
 	}
 
 	// Run benchmarks
-	results := runBenchmarks(providers, *rate, *users, *duration, *timeout, *cooldown, *rampUp, *rampUpDuration, *debug)
+	results := runBenchmarks(providers, *rate, *users, *duration, *timeout, *cooldown, *warmup, *rampUp, *rampUpDuration, *debug)
 
 	// Save results
 	saveResults(results, *outputFile)
@@ -220,15 +228,19 @@ func initializeProviders(bigPayload bool, model string, maxOutputTokens int, suf
 			"model": model,
 		})
 	} else {
+		type chatMessage struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}
 		chatPayload := map[string]interface{}{
-			"messages": []map[string]string{
+			"messages": []chatMessage{
 				{
-					"role":    "system",
-					"content": systemPrompt,
+					Role:    "system",
+					Content: systemPrompt,
 				},
 				{
-					"role":    "user",
-					"content": promptContent,
+					Role:    "user",
+					Content: promptContent,
 				},
 			},
 			"model": model,
@@ -293,6 +305,16 @@ func initializeProviders(bigPayload bool, model string, maxOutputTokens int, suf
 			InputTokens:     inputTokens,
 			MaxOutputTokens: maxOutputTokens,
 		},
+		{
+			Name:            "Zilla",
+			Endpoint:        fmt.Sprintf(baseUrl, os.Getenv("ZILLA_PORT"), suffix),
+			Port:            os.Getenv("ZILLA_PORT"),
+			Payload:         bifrostPayload, // Use bifrost payload format (with prefix)
+			PayloadTemplate: createTemplate(bifrostPayload),
+			RequestType:     requestType,
+			InputTokens:     inputTokens,
+			MaxOutputTokens: maxOutputTokens,
+		},
 	}
 
 	return providers
@@ -339,7 +361,7 @@ func countInputTokens(model string, requestType string, systemPrompt string, pro
 	return len(encoding.Encode(text, nil, nil))
 }
 
-func runBenchmarks(providers []Provider, rate int, users int, duration int, timeout int, cooldown int, rampUp bool, rampUpDuration int, debug bool) []BenchmarkResult {
+func runBenchmarks(providers []Provider, rate int, users int, duration int, timeout int, cooldown int, warmup int, rampUp bool, rampUpDuration int, debug bool) []BenchmarkResult {
 	results := make([]BenchmarkResult, 0, len(providers))
 
 	for i, provider := range providers {
@@ -360,6 +382,16 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 
 		// Define the attack
 		targeter := createTargeter(provider)
+
+		if warmup > 0 {
+			fmt.Printf("Warming up %s for %ds...\n", provider.Name, warmup)
+			warmupCodes := make(map[uint16]int)
+			warmupAttacker := vegeta.NewAttacker(vegeta.Client(httpClient))
+			for res := range warmupAttacker.Attack(targeter, vegeta.Rate{Freq: rate, Per: time.Second}, time.Duration(warmup)*time.Second, provider.Name+" warm-up") {
+				warmupCodes[res.Code]++
+			}
+			fmt.Printf("  Warm-up responses by status code: %v\n", warmupCodes)
+		}
 
 		// Setup for monitoring server memory usage.
 		var serverMemStats []ServerMemStat    // Slice to store memory readings
