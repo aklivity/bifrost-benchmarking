@@ -77,7 +77,7 @@ func main() {
 	timeout := flag.Int("timeout", 300, "Request timeout in seconds (should be duration + expected backend latency)")
 	outputFile := flag.String("output", "results.json", "Output file for results")
 	cooldown := flag.Int("cooldown", 60, "Cooldown period between tests in seconds")
-	warmup := flag.Int("warmup", 0, "Warm-up period in seconds before each test, sent at --rate and left out of the results (only with --rate)")
+	warmup := flag.Int("warmup", 0, "Warm-up period in seconds before each test, ramping up from a tenth of --rate to --rate and left out of the results (only with --rate)")
 	provider := flag.String("provider", "", "Specific provider to benchmark (bifrost, litellm, portkey, zilla, openai)")
 	bigPayload := flag.Bool("big-payload", false, "Use a bigger payload")
 	model := flag.String("model", "gpt-4o-mini", "Model to use")
@@ -384,10 +384,15 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 		targeter := createTargeter(provider)
 
 		if warmup > 0 {
-			fmt.Printf("Warming up %s for %ds...\n", provider.Name, warmup)
+			warmupStart := max(1, rate/10)
+			warmupPacer := vegeta.LinearPacer{
+				StartAt: vegeta.Rate{Freq: warmupStart, Per: time.Second},
+				Slope:   float64(rate-warmupStart) / float64(warmup),
+			}
+			fmt.Printf("Warming up %s for %ds, ramping from %d to %d req/s...\n", provider.Name, warmup, warmupStart, rate)
 			warmupCodes := make(map[uint16]int)
 			warmupAttacker := vegeta.NewAttacker(vegeta.Client(httpClient))
-			for res := range warmupAttacker.Attack(targeter, vegeta.Rate{Freq: rate, Per: time.Second}, time.Duration(warmup)*time.Second, provider.Name+" warm-up") {
+			for res := range warmupAttacker.Attack(targeter, warmupPacer, time.Duration(warmup)*time.Second, provider.Name+" warm-up") {
 				warmupCodes[res.Code]++
 			}
 			fmt.Printf("  Warm-up responses by status code: %v\n", warmupCodes)
