@@ -37,7 +37,7 @@ ZILLA_PORT=7161
 ./benchmark -provider zilla -rate 500 -duration 30
 ```
 
-To compare against Bifrost, run both with the same flags on the same machine, one at a time:
+To compare against Bifrost (config in [`../bifrost`](../bifrost/README.md)), run both with the same flags on the same machine, one at a time:
 
 ```bash
 ./benchmark -provider bifrost -rate 5000 -duration 60 -output results.json

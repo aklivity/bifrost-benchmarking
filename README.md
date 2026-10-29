@@ -8,6 +8,7 @@ Benchmarking and load-testing tools for [Bifrost](https://github.com/maximhq/bif
 | --- | --- | --- |
 | [`benchmark.go`](#gateway-benchmark-benchmarkgo) (this directory) | Gateway comparison benchmark built on Vegeta | Compare Bifrost against LiteLLM, Portkey, Zilla, or raw OpenAI — latency percentiles, throughput, and server memory usage |
 | [`hitter/`](hitter/README.md) | Standalone load generator for chat completions | Load-test a single Bifrost deployment with realistic traffic: multiple models/providers, streaming, virtual keys, PDF attachments |
+| [`bifrost/`](bifrost/README.md) | Bifrost gateway config and Docker Compose file | Run Bifrost in front of the mocker with the exact config used for the Zilla comparison |
 | [`zilla/`](zilla/README.md) | Zilla gateway config and Docker Compose file | Run Zilla in front of the mocker so `benchmark.go` can compare it with Bifrost |
 | [`mocker/`](mocker/README.md) | Mock LLM provider server (fasthttp) | Simulate OpenAI / Anthropic / Gemini / Bedrock endpoints with configurable latency, failures, and rate limits — no API costs, no provider noise |
 | [`mcp-code-mode-benchmark/`](mcp-code-mode-benchmark/README.md) | MCP Code Mode benchmark (Python) | Reproduce our token/latency/pass-rate numbers for [Bifrost's MCP Code Mode](https://docs.getbifrost.ai/mcp/code-mode) |
@@ -37,6 +38,7 @@ cd mocker && go run main.go -port 8000
 ```bash
 npx -y @maximhq/bifrost
 # or: docker run -p 8080:8080 maximhq/bifrost
+# or, with the config used for the Zilla comparison: cd bifrost && docker compose up -d --wait
 ```
 
 Setup details, performance tuning (concurrency, buffer and pool sizes), and Docker networking notes for reaching the mocker from inside a container are in the [Bifrost docs](https://docs.getbifrost.ai/quickstart/gateway/setting-up).
@@ -170,6 +172,7 @@ benchmark.go              # gateway comparison benchmark (documented above)
 pkg/concurrent/           # semaphore-based concurrency engine for -users mode
 hitter/                   # load generator for Bifrost — see hitter/README.md
 mocker/                   # mock LLM provider server — see mocker/README.md
+bifrost/                  # Bifrost gateway config for benchmark.go — see bifrost/README.md
 zilla/                    # Zilla gateway config for benchmark.go — see zilla/README.md
 mcp-code-mode-benchmark/  # MCP Code Mode benchmark — see its README.md
 model-routing-benchmark/  # model-routing reports and runners, organized by benchmark
