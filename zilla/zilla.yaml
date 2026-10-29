@@ -37,7 +37,13 @@ bindings:
     options:
       dialect: openai
       server: ${{env.MOCKER_URL}}
-    exit: sys:http_client
+    exit: south_http_client
+  south_http_client:
+    type: http
+    kind: client
+    options:
+      versions: [ http/1.1 ]
+    exit: sys:tcp_client
 telemetry:
   exporters:
     stdout_logs_exporter:
