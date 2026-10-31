@@ -249,6 +249,7 @@ All configuration options can be set via environment variables, which is especia
 - `MOCKER_TPM_DURATION`: Duration in seconds for the TPM window; TPM is active from `MOCKER_TPM` to `MOCKER_TPM + MOCKER_TPM_DURATION` seconds (default: `0`, active until server stop)
 - `MOCKER_TPM_AUTH_KEYS`: Comma-separated bearer token values that trigger TPM; the `Bearer ` prefix is stripped automatically before comparison, so pass raw tokens (e.g. `key-A,key-B`); other keys are unaffected (default: `""`, all requests)
 - `MOCKER_LOG_RAW`: Log raw HTTP requests and responses - set to `true`, `1`, `false`, or `0` (default: `false`)
+- `MOCKER_H2C`: Serve HTTP/2 cleartext alongside HTTP/1.1 - set to `true`, `1`, `false`, or `0` (default: `false`)
 
 **Example using environment variables:**
 
@@ -318,6 +319,7 @@ services:
 - `-tpm-duration <seconds>`: Duration in seconds for the TPM window. TPM is active from `-tpm` to `-tpm + -tpm-duration` seconds; after the window closes requests succeed again (default: `0`, active until server stop)
 - `-tpm-auth-keys <keys>`: Comma-separated bearer token values that should be rate-limited. The `Bearer ` prefix is stripped automatically before comparison, so pass the raw token (e.g. `"key-A,key-B"`). Requests with any other key are unaffected (default: `""`, all requests)
 - `-log-raw`: Log raw HTTP request and response bodies for debugging and inspection (default: `false`)
+- `-h2c`: Serve HTTP/2 cleartext with prior knowledge as well as HTTP/1.1 on the same port, via `net/http` instead of fasthttp (default: `false`)
 
 **Note:** Command-line flags override environment variables. If `-auth` is set to an empty string (`-auth ""`), authentication is disabled. Otherwise, all requests must include the exact authentication header value.
 

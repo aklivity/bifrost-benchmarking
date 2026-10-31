@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -323,6 +326,7 @@ var (
 	modelsList         string
 	systemOneTier      string
 	logRaw             bool
+	h2c                bool
 	rateLimitedKeys    string
 	rateLimitedKeyMap  map[string]bool
 	startTime          time.Time
@@ -423,6 +427,7 @@ func init() {
 	flag.StringVar(&modelsList, "models", getEnvString("MOCKER_MODELS", "gpt-4o-mini,gpt-4o,claude-3-5-sonnet-latest,gemini-2.0-flash"), "Comma-separated model ids returned by GET /v1/models")
 	flag.StringVar(&systemOneTier, "systemone-tier", getEnvString("MOCKER_SYSTEMONE_TIER", "SIMPLE"), "Fixed Jev complexity tier returned by POST /v1/systemone (SIMPLE, MEDIUM, or COMPLEX)")
 	flag.BoolVar(&logRaw, "log-raw", getEnvBool("MOCKER_LOG_RAW", false), "Log raw request and response bodies")
+	flag.BoolVar(&h2c, "h2c", getEnvBool("MOCKER_H2C", false), "Serve HTTP/2 cleartext (prior knowledge) as well as HTTP/1.1, via net/http instead of fasthttp")
 	flag.StringVar(&rateLimitedKeys, "rate-limited-keys", getEnvString("MOCKER_RATE_LIMITED_KEYS", ""), "Comma-separated list of Authorization header values that always receive 429 (e.g. 'Bearer key-1,Bearer key-2')")
 	flag.StringVar(&latencySpikeKeys, "latency-spike-keys", getEnvString("MOCKER_LATENCY_SPIKE_KEYS", ""), "Per-key sparse latency spikes as key=pct:mult (e.g. 'slow-key=10:5' → 10% of requests get 5x latency). Tests outlier rejection.")
 	flag.StringVar(&latencyRampKeys, "latency-ramp-keys", getEnvString("MOCKER_LATENCY_RAMP_KEYS", ""), "Per-key linear base-latency drift in ms added per minute elapsed (e.g. 'slow-key=2000'). Tests gradual-drift tracking.")
@@ -2110,10 +2115,14 @@ func main() {
 	})
 
 	addr := fmt.Sprintf("%s:%d", host, port)
+	serverKind := "fasthttp"
+	if h2c {
+		serverKind = "net/http, h2c"
+	}
 	if jitter > 0 {
-		log.Printf("Mock LLM server (fasthttp) starting on %s with latency %dms ±%dms jitter...\n", addr, latency, jitter)
+		log.Printf("Mock LLM server (%s) starting on %s with latency %dms ±%dms jitter...\n", serverKind, addr, latency, jitter)
 	} else {
-		log.Printf("Mock LLM server (fasthttp) starting on %s with latency %dms...\n", addr, latency)
+		log.Printf("Mock LLM server (%s) starting on %s with latency %dms...\n", serverKind, addr, latency)
 	}
 	if latencyAuthKeys != "" {
 		log.Printf("Latency will only apply to requests with auth keys: %s", latencyAuthKeys)
@@ -2139,6 +2148,11 @@ func main() {
 	}
 	log.Printf("Max request body size: 50MB")
 
+	if h2c {
+		serveH2C(addr)
+		return
+	}
+
 	// Create fasthttp server with 50MB max request body size
 	server := &fasthttp.Server{
 		Handler:            router,
@@ -2152,4 +2166,68 @@ func main() {
 	if err := server.ListenAndServe(addr); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
+}
+
+func serveH2C(addr string) {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+
+	server := &http.Server{
+		Addr:         addr,
+		Protocols:    protocols,
+		HTTP2:        &http.HTTP2Config{MaxConcurrentStreams: 1 << 20},
+		Handler:      http.HandlerFunc(serveFastHTTP),
+		ReadTimeout:  300 * time.Second,
+		WriteTimeout: 300 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+func serveFastHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 50*1024*1024))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req fasthttp.Request
+	req.Header.SetMethod(r.Method)
+	req.SetRequestURI(r.URL.RequestURI())
+	req.Header.SetHost(r.Host)
+	for name, values := range r.Header {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
+	req.SetBody(body)
+
+	var ctx fasthttp.RequestCtx
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", r.RemoteAddr)
+	ctx.Init(&req, remoteAddr, nil)
+	router(&ctx)
+
+	ctx.Response.Header.VisitAll(func(name, value []byte) {
+		w.Header().Add(string(name), string(value))
+	})
+	w.Header().Del("Content-Length")
+	w.WriteHeader(ctx.Response.StatusCode())
+	ctx.Response.BodyWriteTo(flushWriter{w, http.NewResponseController(w)})
+}
+
+type flushWriter struct {
+	w  http.ResponseWriter
+	rc *http.ResponseController
+}
+
+func (f flushWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if err == nil {
+		err = f.rc.Flush()
+	}
+	return n, err
 }
