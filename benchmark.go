@@ -90,6 +90,7 @@ func main() {
 	rampUp := flag.Bool("ramp-up", false, "Enable gradual ramp-up of users (only with --users, requires --ramp-up-duration)")
 	rampUpDuration := flag.Int("ramp-up-duration", 0, "Duration in seconds to ramp up to target users (only with --users and --ramp-up)")
 	debug := flag.Bool("debug", false, "Enable debug mode with detailed logging and periodic status updates")
+	h2c := flag.Bool("h2c", false, "Use HTTP/2 cleartext with prior knowledge instead of HTTP/1.1")
 
 	// Parse the command line flags.
 	flag.Parse()
@@ -163,7 +164,7 @@ func main() {
 	}
 
 	// Run benchmarks
-	results := runBenchmarks(providers, *rate, *users, *duration, *timeout, *cooldown, *warmup, *rampUp, *rampUpDuration, *debug)
+	results := runBenchmarks(providers, *rate, *users, *duration, *timeout, *cooldown, *warmup, *rampUp, *rampUpDuration, *debug, *h2c)
 
 	// Save results
 	saveResults(results, *outputFile)
@@ -361,7 +362,7 @@ func countInputTokens(model string, requestType string, systemPrompt string, pro
 	return len(encoding.Encode(text, nil, nil))
 }
 
-func runBenchmarks(providers []Provider, rate int, users int, duration int, timeout int, cooldown int, warmup int, rampUp bool, rampUpDuration int, debug bool) []BenchmarkResult {
+func runBenchmarks(providers []Provider, rate int, users int, duration int, timeout int, cooldown int, warmup int, rampUp bool, rampUpDuration int, debug bool, h2c bool) []BenchmarkResult {
 	results := make([]BenchmarkResult, 0, len(providers))
 
 	for i, provider := range providers {
@@ -373,6 +374,12 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 			MaxConnsPerHost:     0,
 			IdleConnTimeout:     10 * time.Second,
 			// Optionally tune TLS and other settings if needed
+		}
+
+		if h2c {
+			protocols := new(http.Protocols)
+			protocols.SetUnencryptedHTTP2(true)
+			httpTransport.Protocols = protocols
 		}
 
 		httpClient := &http.Client{

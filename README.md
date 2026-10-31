@@ -87,6 +87,7 @@ A command-line tool that fires load at one or more gateways and records latency 
 | `-ramp-up` | bool | false | Gradually ramp users up (only with `-users`, requires `-ramp-up-duration`) |
 | `-ramp-up-duration` | int | 0 | Seconds to ramp from 1 to `-users` users |
 | `-debug` | bool | false | Detailed logging and periodic status updates during the run |
+| `-h2c` | bool | false | Use HTTP/2 cleartext with prior knowledge instead of HTTP/1.1 (the target must accept h2c, e.g. the mocker with `-h2c`) |
 
 \* Exactly one of `-rate` or `-users` must be provided.
 
