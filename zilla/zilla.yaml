@@ -42,5 +42,5 @@ bindings:
     type: http
     kind: client
     options:
-      versions: [ http/1.1 ]
+      versions: [ h2 ]
     exit: sys:tcp_client

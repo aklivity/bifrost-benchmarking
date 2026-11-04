@@ -4,17 +4,17 @@ Runs [Zilla](https://github.com/aklivity/zilla) as an OpenAI-compatible gateway 
 
 | File | What it is |
 | --- | --- |
-| `zilla.yaml` | Gateway config: `POST /v1/chat/completions` on port 7161, `gpt-*` models routed to the OpenAI upstream at `MOCKER_URL` |
+| `zilla.yaml` | Gateway config: `POST /v1/chat/completions` on port 7161, `gpt-*` models routed to the OpenAI upstream at `MOCKER_URL` over HTTP/2 cleartext (h2c) |
 | `docker-compose.yml` | Runs `ghcr.io/aklivity/zilla` (version from `ZILLA_VERSION`, default `2.6.0`) with that config |
 
 This is the Zilla equivalent of a Bifrost setup with a single OpenAI provider whose base URL is the mocker: one upstream, no retries, no caching, no logging, and no API key required from the caller (`benchmark.go` sends no `Authorization` header to gateways).
 
 ## Run
 
-**1. Start the mocker** on the host:
+**1. Start the mocker** on the host, serving h2c for Zilla's upstream connections:
 
 ```bash
-cd mocker && go run main.go -port 8000
+cd mocker && go run main.go -port 8000 -h2c
 ```
 
 **2. Start Zilla:**
