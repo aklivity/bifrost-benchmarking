@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -91,6 +92,7 @@ func main() {
 	rampUpDuration := flag.Int("ramp-up-duration", 0, "Duration in seconds to ramp up to target users (only with --users and --ramp-up)")
 	debug := flag.Bool("debug", false, "Enable debug mode with detailed logging and periodic status updates")
 	h2c := flag.Bool("h2c", false, "Use HTTP/2 cleartext with prior knowledge instead of HTTP/1.1")
+	h2cConns := flag.Int("h2c-conns", 1, "With -h2c, spread requests round robin over this many HTTP/2 connections")
 
 	// Parse the command line flags.
 	flag.Parse()
@@ -164,7 +166,7 @@ func main() {
 	}
 
 	// Run benchmarks
-	results := runBenchmarks(providers, *rate, *users, *duration, *timeout, *cooldown, *warmup, *rampUp, *rampUpDuration, *debug, *h2c)
+	results := runBenchmarks(providers, *rate, *users, *duration, *timeout, *cooldown, *warmup, *rampUp, *rampUpDuration, *debug, *h2c, *h2cConns)
 
 	// Save results
 	saveResults(results, *outputFile)
@@ -362,28 +364,40 @@ func countInputTokens(model string, requestType string, systemPrompt string, pro
 	return len(encoding.Encode(text, nil, nil))
 }
 
-func runBenchmarks(providers []Provider, rate int, users int, duration int, timeout int, cooldown int, warmup int, rampUp bool, rampUpDuration int, debug bool, h2c bool) []BenchmarkResult {
+func runBenchmarks(providers []Provider, rate int, users int, duration int, timeout int, cooldown int, warmup int, rampUp bool, rampUpDuration int, debug bool, h2c bool, h2cConns int) []BenchmarkResult {
 	results := make([]BenchmarkResult, 0, len(providers))
 
 	for i, provider := range providers {
 		fmt.Printf("Benchmarking %s...\n", provider.Name)
 
-		httpTransport := &http.Transport{
-			Proxy:               http.ProxyFromEnvironment,
-			MaxIdleConnsPerHost: 100000,
-			MaxConnsPerHost:     0,
-			IdleConnTimeout:     10 * time.Second,
-			// Optionally tune TLS and other settings if needed
+		newTransport := func() *http.Transport {
+			httpTransport := &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
+				MaxIdleConnsPerHost: 100000,
+				MaxConnsPerHost:     0,
+				IdleConnTimeout:     10 * time.Second,
+				// Optionally tune TLS and other settings if needed
+			}
+
+			if h2c {
+				protocols := new(http.Protocols)
+				protocols.SetUnencryptedHTTP2(true)
+				httpTransport.Protocols = protocols
+			}
+			return httpTransport
 		}
 
-		if h2c {
-			protocols := new(http.Protocols)
-			protocols.SetUnencryptedHTTP2(true)
-			httpTransport.Protocols = protocols
+		var transport http.RoundTripper = newTransport()
+		if h2c && h2cConns > 1 {
+			transports := make([]http.RoundTripper, h2cConns)
+			for t := range transports {
+				transports[t] = newTransport()
+			}
+			transport = &roundRobinTransport{transports: transports}
 		}
 
 		httpClient := &http.Client{
-			Transport: httpTransport,
+			Transport: transport,
 			Timeout:   time.Duration(timeout) * time.Second,
 		}
 
@@ -844,4 +858,15 @@ func saveResults(results []BenchmarkResult, outputFile string) {
 	}
 
 	fmt.Printf("Results saved to %s\n", outputFile)
+}
+
+// roundRobinTransport spreads requests over several transports, each holding its own HTTP/2 connection
+type roundRobinTransport struct {
+	transports []http.RoundTripper
+	next       atomic.Uint64
+}
+
+func (r *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	i := r.next.Add(1) - 1
+	return r.transports[i%uint64(len(r.transports))].RoundTrip(req)
 }
