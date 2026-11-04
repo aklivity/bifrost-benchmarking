@@ -44,7 +44,3 @@ bindings:
     options:
       versions: [ http/1.1 ]
     exit: sys:tcp_client
-telemetry:
-  exporters:
-    stdout_logs_exporter:
-      type: stdout
