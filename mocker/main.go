@@ -315,7 +315,6 @@ var (
 	fixedInputTokens   int
 	fixedOutputTokens  int
 	bigPayload         bool
-	contentRepeat      int
 	auth               string
 	withErrors         bool
 	failurePercent     int
@@ -416,7 +415,6 @@ func init() {
 	flag.IntVar(&fixedInputTokens, "input-tokens", getEnvInt("MOCKER_INPUT_TOKENS", -1), "Fixed input/prompt token count to report in usage (negative = random/derived per request)")
 	flag.IntVar(&fixedOutputTokens, "output-tokens", getEnvInt("MOCKER_OUTPUT_TOKENS", -1), "Fixed output/completion token count to report in usage (negative = random/derived per request)")
 	flag.BoolVar(&bigPayload, "big-payload", getEnvBool("MOCKER_BIG_PAYLOAD", false), "Use big payload")
-	flag.IntVar(&contentRepeat, "content-repeat", getEnvInt("MOCKER_CONTENT_REPEAT", 1), "Repeat the default response content this many times when -big-payload is off (182 gives the ~10KB response of the original -big-payload)")
 	flag.StringVar(&auth, "auth", getEnvString("MOCKER_AUTH", ""), "Add authentication header key")
 	flag.BoolVar(&withErrors, "with-errors", getEnvBool("MOCKER_WITH_ERRORS", false), "Enable provider-specific random error responses")
 	flag.BoolVar(&withErrors, "witherrors", getEnvBool("MOCKER_WITH_ERRORS", false), "Alias of -with-errors")
@@ -533,7 +531,7 @@ func buildLargeMockContent(targetTokens int) string {
 
 func mockTextContent(defaultContent string) string {
 	if !bigPayload {
-		return strings.Repeat(defaultContent, max(contentRepeat, 1))
+		return defaultContent
 	}
 	targetTokens := largePayloadMinTokens + rand.Intn(largePayloadMaxTokens-largePayloadMinTokens+1)
 	return buildLargeMockContent(targetTokens)
