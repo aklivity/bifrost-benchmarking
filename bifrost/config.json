@@ -1,0 +1,26 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "client": {
+    "initial_pool_size": 10000,
+    "drop_excess_requests": false,
+    "enable_logging": false,
+    "disable_content_logging": true,
+    "enforce_auth_on_inference": false
+  },
+  "providers": {
+    "openai": {
+      "keys": [
+        { "name": "mock-openai", "value": "mock-key", "models": ["gpt-4o-mini"], "weight": 1.0 }
+      ],
+      "network_config": {
+        "base_url": "http://host.docker.internal:8000",
+        "default_request_timeout_in_seconds": 120,
+        "max_retries": 0,
+        "allow_private_network": true
+      },
+      "concurrency_and_buffer_size": { "concurrency": 1000, "buffer_size": 15000 }
+    }
+  },
+  "config_store": { "enabled": false },
+  "logs_store": { "enabled": false }
+}

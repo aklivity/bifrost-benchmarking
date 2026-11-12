@@ -1,0 +1,18 @@
+services:
+  zilla:
+    image: ghcr.io/aklivity/zilla:${ZILLA_VERSION:-2.6.0}
+    command: ["start", "-v", "-e"]
+    environment:
+      # where Zilla reaches the mocker; the default is the mocker on the host (go run main.go -port 8000)
+      - MOCKER_URL=${MOCKER_URL:-http://host.docker.internal:8000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./zilla.yaml:/etc/zilla/zilla.yaml:ro
+    ports:
+      - "7161:7161"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /var/run/zilla/ready"]
+      interval: 1s
+      retries: 60
+    restart: unless-stopped

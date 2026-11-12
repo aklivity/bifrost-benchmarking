@@ -4,15 +4,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -37,6 +42,8 @@ type Provider struct {
 	RequestType     string // Type of request: "chat" or "embedding"
 	InputTokens     int    // Estimated input tokens for the request payload prompt/messages
 	MaxOutputTokens int    // Requested max output tokens for chat requests
+	Dialect         string // Request dialect: "openai" (chat completions) or "anthropic" (messages)
+	Stream          bool   // Whether requests ask for a streamed (SSE) response
 }
 
 // BenchmarkResult holds the aggregated metrics from a single benchmark run for a provider.
@@ -48,6 +55,16 @@ type BenchmarkResult struct {
 	DropReasons       map[string]int  // Tracks reasons for dropped or failed requests and their counts
 	InputTokens       int             // Estimated input tokens per request
 	MaxOutputTokens   int             // Requested max output tokens per chat request
+	FirstEvent        LatencySummary  // Time to the first SSE data event, for streamed requests in the measured window
+}
+
+type LatencySummary struct {
+	Count int
+	Mean  time.Duration
+	P50   time.Duration
+	P90   time.Duration
+	P99   time.Duration
+	Max   time.Duration
 }
 
 // MemStat captures generic memory statistics (currently unused in active logic but defined for potential future use).
@@ -77,7 +94,8 @@ func main() {
 	timeout := flag.Int("timeout", 300, "Request timeout in seconds (should be duration + expected backend latency)")
 	outputFile := flag.String("output", "results.json", "Output file for results")
 	cooldown := flag.Int("cooldown", 60, "Cooldown period between tests in seconds")
-	provider := flag.String("provider", "", "Specific provider to benchmark (bifrost, litellm, portkey, openai)")
+	warmup := flag.Int("warmup", 0, "Warm-up period in seconds before each test, ramping up from a tenth of --rate to --rate and left out of the results (only with --rate)")
+	provider := flag.String("provider", "", "Specific provider to benchmark (bifrost, litellm, portkey, zilla, openai)")
 	bigPayload := flag.Bool("big-payload", false, "Use a bigger payload")
 	model := flag.String("model", "gpt-4o-mini", "Model to use")
 	maxOutputTokens := flag.Int("max-output-tokens", 0, "Max output tokens for chat requests. Defaults to 3000 with --big-payload and is omitted otherwise")
@@ -89,6 +107,10 @@ func main() {
 	rampUp := flag.Bool("ramp-up", false, "Enable gradual ramp-up of users (only with --users, requires --ramp-up-duration)")
 	rampUpDuration := flag.Int("ramp-up-duration", 0, "Duration in seconds to ramp up to target users (only with --users and --ramp-up)")
 	debug := flag.Bool("debug", false, "Enable debug mode with detailed logging and periodic status updates")
+	h2c := flag.Bool("h2c", false, "Use HTTP/2 cleartext with prior knowledge instead of HTTP/1.1")
+	h2cConns := flag.Int("h2c-conns", 1, "With -h2c, spread requests round robin over this many HTTP/2 connections")
+	dialect := flag.String("dialect", "openai", "Chat request dialect: 'openai' (chat completions) or 'anthropic' (messages)")
+	stream := flag.Bool("stream", false, "Ask for streamed (SSE) responses and record time to the first event")
 
 	// Parse the command line flags.
 	flag.Parse()
@@ -99,6 +121,13 @@ func main() {
 	}
 	if *rate == 0 && *users == 0 {
 		log.Fatalf("Either --rate or --users flag must be provided.")
+	}
+
+	if *warmup < 0 {
+		log.Fatalf("--warmup cannot be negative")
+	}
+	if *warmup > 0 && *rate == 0 {
+		log.Fatalf("--warmup can only be used with --rate flag.")
 	}
 
 	// Validate ramp-up flags
@@ -119,6 +148,13 @@ func main() {
 		log.Fatalf("Invalid request-type '%s'. Must be 'chat' or 'embedding'", *requestType)
 	}
 
+	if *dialect != "openai" && *dialect != "anthropic" {
+		log.Fatalf("Invalid dialect '%s'. Must be 'openai' or 'anthropic'", *dialect)
+	}
+	if *dialect == "anthropic" && *requestType != "chat" {
+		log.Fatalf("--dialect anthropic only applies to --request-type chat")
+	}
+
 	if *maxOutputTokens < 0 {
 		log.Fatalf("--max-output-tokens cannot be negative")
 	}
@@ -135,7 +171,7 @@ func main() {
 	}
 
 	// Initialize providers
-	providers := initializeProviders(*bigPayload, *model, *maxOutputTokens, *suffix, *path, *requestType, filePrompt, *host)
+	providers := initializeProviders(*bigPayload, *model, *maxOutputTokens, *suffix, *path, *requestType, filePrompt, *host, *dialect, *stream)
 
 	// Filter providers if specific provider is requested
 	if *provider != "" {
@@ -155,7 +191,7 @@ func main() {
 	}
 
 	// Run benchmarks
-	results := runBenchmarks(providers, *rate, *users, *duration, *timeout, *cooldown, *rampUp, *rampUpDuration, *debug)
+	results := runBenchmarks(providers, *rate, *users, *duration, *timeout, *cooldown, *warmup, *rampUp, *rampUpDuration, *debug, *h2c, *h2cConns)
 
 	// Save results
 	saveResults(results, *outputFile)
@@ -173,7 +209,7 @@ func getProviderNames(providers []Provider) []string {
 // initializeProvider creates and configures a Provider struct based on the command-line arguments.
 // It determines the payload (small or big) and marshals it into JSON bytes.
 // Placeholders #{request_index} and #{timestamp} in the payload content will be dynamically replaced.
-func initializeProviders(bigPayload bool, model string, maxOutputTokens int, suffix string, apiPath string, requestType string, filePrompt string, host string) []Provider {
+func initializeProviders(bigPayload bool, model string, maxOutputTokens int, suffix string, apiPath string, requestType string, filePrompt string, host string, dialect string, stream bool) []Provider {
 	// Load environment variables from .env file
 	if err := godotenv.Load(); err != nil {
 		log.Fatalf("Error loading .env file: %v", err)
@@ -219,22 +255,58 @@ func initializeProviders(bigPayload bool, model string, maxOutputTokens int, suf
 			"input": promptContent,
 			"model": model,
 		})
-	} else {
-		chatPayload := map[string]interface{}{
-			"messages": []map[string]string{
+	} else if dialect == "anthropic" {
+		type anthropicMessage struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}
+		anthropicMaxTokens := maxOutputTokens
+		if anthropicMaxTokens == 0 {
+			anthropicMaxTokens = 1024
+		}
+		anthropicPayload := struct {
+			Model     string             `json:"model"`
+			MaxTokens int                `json:"max_tokens"`
+			System    string             `json:"system"`
+			Messages  []anthropicMessage `json:"messages"`
+			Stream    bool               `json:"stream,omitempty"`
+		}{
+			Model:     model,
+			MaxTokens: anthropicMaxTokens,
+			System:    systemPrompt,
+			Messages: []anthropicMessage{
 				{
-					"role":    "system",
-					"content": systemPrompt,
+					Role:    "user",
+					Content: promptContent,
+				},
+			},
+			Stream: stream,
+		}
+		bifrostPayload, _ = sonic.Marshal(anthropicPayload)
+		openaiPayload = bifrostPayload
+	} else {
+		type chatMessage struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}
+		chatPayload := map[string]interface{}{
+			"messages": []chatMessage{
+				{
+					Role:    "system",
+					Content: systemPrompt,
 				},
 				{
-					"role":    "user",
-					"content": promptContent,
+					Role:    "user",
+					Content: promptContent,
 				},
 			},
 			"model": model,
 		}
 		if maxOutputTokens > 0 {
 			chatPayload["max_tokens"] = maxOutputTokens
+		}
+		if stream {
+			chatPayload["stream"] = true
 		}
 
 		// Bifrost chat completion format (with openai/ prefix)
@@ -262,6 +334,8 @@ func initializeProviders(bigPayload bool, model string, maxOutputTokens int, suf
 			RequestType:     requestType,
 			InputTokens:     inputTokens,
 			MaxOutputTokens: maxOutputTokens,
+			Dialect:         dialect,
+			Stream:          stream,
 		},
 		{
 			Name:            "Bifrost",
@@ -272,6 +346,8 @@ func initializeProviders(bigPayload bool, model string, maxOutputTokens int, suf
 			RequestType:     requestType,
 			InputTokens:     inputTokens,
 			MaxOutputTokens: maxOutputTokens,
+			Dialect:         dialect,
+			Stream:          stream,
 		},
 		{
 			Name:            "Litellm",
@@ -282,6 +358,8 @@ func initializeProviders(bigPayload bool, model string, maxOutputTokens int, suf
 			RequestType:     requestType,
 			InputTokens:     inputTokens,
 			MaxOutputTokens: maxOutputTokens,
+			Dialect:         dialect,
+			Stream:          stream,
 		},
 		{
 			Name:            "Portkey",
@@ -292,6 +370,20 @@ func initializeProviders(bigPayload bool, model string, maxOutputTokens int, suf
 			RequestType:     requestType,
 			InputTokens:     inputTokens,
 			MaxOutputTokens: maxOutputTokens,
+			Dialect:         dialect,
+			Stream:          stream,
+		},
+		{
+			Name:            "Zilla",
+			Endpoint:        fmt.Sprintf(baseUrl, os.Getenv("ZILLA_PORT"), suffix),
+			Port:            os.Getenv("ZILLA_PORT"),
+			Payload:         bifrostPayload, // Use bifrost payload format (with prefix)
+			PayloadTemplate: createTemplate(bifrostPayload),
+			RequestType:     requestType,
+			InputTokens:     inputTokens,
+			MaxOutputTokens: maxOutputTokens,
+			Dialect:         dialect,
+			Stream:          stream,
 		},
 	}
 
@@ -339,27 +431,69 @@ func countInputTokens(model string, requestType string, systemPrompt string, pro
 	return len(encoding.Encode(text, nil, nil))
 }
 
-func runBenchmarks(providers []Provider, rate int, users int, duration int, timeout int, cooldown int, rampUp bool, rampUpDuration int, debug bool) []BenchmarkResult {
+func runBenchmarks(providers []Provider, rate int, users int, duration int, timeout int, cooldown int, warmup int, rampUp bool, rampUpDuration int, debug bool, h2c bool, h2cConns int) []BenchmarkResult {
 	results := make([]BenchmarkResult, 0, len(providers))
 
 	for i, provider := range providers {
 		fmt.Printf("Benchmarking %s...\n", provider.Name)
 
-		httpTransport := &http.Transport{
-			Proxy:               http.ProxyFromEnvironment,
-			MaxIdleConnsPerHost: 100000,
-			MaxConnsPerHost:     0,
-			IdleConnTimeout:     10 * time.Second,
-			// Optionally tune TLS and other settings if needed
+		newTransport := func() *http.Transport {
+			httpTransport := &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
+				MaxIdleConnsPerHost: 100000,
+				MaxConnsPerHost:     0,
+				IdleConnTimeout:     10 * time.Second,
+				// Optionally tune TLS and other settings if needed
+			}
+
+			if h2c {
+				protocols := new(http.Protocols)
+				protocols.SetUnencryptedHTTP2(true)
+				httpTransport.Protocols = protocols
+			}
+			return httpTransport
+		}
+
+		var transport http.RoundTripper = newTransport()
+		if h2c && h2cConns > 1 {
+			transports := make([]http.RoundTripper, h2cConns)
+			for t := range transports {
+				transports[t] = newTransport()
+			}
+			transport = &roundRobinTransport{transports: transports}
+		}
+		firstEvents := &firstEventRecorder{}
+		errorBodyLogged := false
+		if provider.Stream {
+			transport = &firstEventTransport{next: transport, recorder: firstEvents}
 		}
 
 		httpClient := &http.Client{
-			Transport: httpTransport,
+			Transport: transport,
 			Timeout:   time.Duration(timeout) * time.Second,
 		}
 
 		// Define the attack
 		targeter := createTargeter(provider)
+
+		if warmup > 0 {
+			warmupStart := max(1, rate/10)
+			warmupPacer := vegeta.LinearPacer{
+				StartAt: vegeta.Rate{Freq: warmupStart, Per: time.Second},
+				Slope:   float64(rate-warmupStart) / float64(warmup),
+			}
+			fmt.Printf("Warming up %s for %ds, ramping from %d to %d req/s...\n", provider.Name, warmup, warmupStart, rate)
+			warmupCodes := make(map[uint16]int)
+			warmupAttacker := vegeta.NewAttacker(vegeta.Client(httpClient))
+			for res := range warmupAttacker.Attack(targeter, warmupPacer, time.Duration(warmup)*time.Second, provider.Name+" warm-up") {
+				warmupCodes[res.Code]++
+				if res.Code >= 400 && !errorBodyLogged {
+					errorBodyLogged = true
+					log.Printf("First warm-up error response: HTTP %d %s", res.Code, string(res.Body[:min(len(res.Body), 2000)]))
+				}
+			}
+			fmt.Printf("  Warm-up responses by status code: %v\n", warmupCodes)
+		}
 
 		// Setup for monitoring server memory usage.
 		var serverMemStats []ServerMemStat    // Slice to store memory readings
@@ -442,7 +576,17 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 			attacker := vegeta.NewAttacker(vegeta.Client(httpClient))
 			pacer := vegeta.Rate{Freq: rate, Per: time.Second}
 
+			firstEvents.active.Store(true)
 			for res := range attacker.Attack(targeter, pacer, time.Duration(duration)*time.Second, provider.Name) {
+				if res.Code >= 400 && !errorBodyLogged {
+					errorBodyLogged = true
+					log.Printf("First error response: HTTP %d %s", res.Code, string(res.Body[:min(len(res.Body), 2000)]))
+				}
+				if res.Error == "" && res.Code >= 200 && res.Code < 300 && !responseComplete(provider, res.Body) {
+					res.Code = 0
+					res.Error = "incomplete response body"
+				}
+				res.Body = nil
 				metrics.Add(res)
 
 				// Track drop reasons
@@ -464,6 +608,7 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 			}
 
 		EndAttack: // Label to jump to when the attack finishes or times out
+			firstEvents.active.Store(false)
 			metrics.Close() // Finalize metrics calculation
 		}
 
@@ -487,6 +632,7 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 			DropReasons:       dropReasons,
 			InputTokens:       provider.InputTokens,
 			MaxOutputTokens:   provider.MaxOutputTokens,
+			FirstEvent:        firstEvents.summary(),
 		})
 
 		fmt.Println(metrics.StatusCodes) // Print status code distribution to console
@@ -505,6 +651,10 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 		fmt.Printf("  P99 Latency: %s\n", metrics.Latencies.P99)
 		fmt.Printf("  Max Latency: %s\n", metrics.Latencies.Max)
 		fmt.Printf("  Throughput: %.2f/s\n", metrics.Throughput)
+		if provider.Stream {
+			fe := firstEvents.summary()
+			fmt.Printf("  First SSE Event (%d): P50 %s, P99 %s, Max %s\n", fe.Count, fe.P50, fe.P99, fe.Max)
+		}
 
 		// Print server memory statistics summary if data was collected.
 		if len(serverMemStatsCopy) > 0 {
@@ -634,6 +784,10 @@ func createTargeter(provider Provider) vegeta.Targeter {
 			"Content-Type": []string{"application/json"},
 			// "x-bf-vk":      []string{"f452b625-a65e-4dfd-b48d-0ee3ba0e8d46"},
 		}
+		if provider.Dialect == "anthropic" {
+			tgt.Header.Set("x-api-key", "benchmark")
+			tgt.Header.Set("anthropic-version", "2023-06-01")
+		}
 
 		// Add Authorization header for OpenAI
 		if provider.Name == "OpenAI" {
@@ -727,6 +881,12 @@ func saveResults(results []BenchmarkResult, outputFile string) {
 		DropReasons        map[string]int `json:"drop_reasons"`          // Counts of reasons for dropped/failed requests
 		InputTokens        int            `json:"input_tokens"`          // Estimated input tokens per request
 		MaxOutputTokens    int            `json:"max_output_tokens"`     // Requested max output tokens per chat request
+		FirstEventCount    int            `json:"first_event_count,omitempty"`
+		FirstEventMeanMs   float64        `json:"first_event_mean_ms,omitempty"`
+		FirstEventP50Ms    float64        `json:"first_event_p50_ms,omitempty"`
+		FirstEventP90Ms    float64        `json:"first_event_p90_ms,omitempty"`
+		FirstEventP99Ms    float64        `json:"first_event_p99_ms,omitempty"`
+		FirstEventMaxMs    float64        `json:"first_event_max_ms,omitempty"`
 	}
 
 	// Create a map with provider names as keys
@@ -784,6 +944,12 @@ func saveResults(results []BenchmarkResult, outputFile string) {
 			DropReasons:        res.DropReasons,
 			InputTokens:        res.InputTokens,
 			MaxOutputTokens:    res.MaxOutputTokens,
+			FirstEventCount:    res.FirstEvent.Count,
+			FirstEventMeanMs:   float64(res.FirstEvent.Mean) / float64(time.Millisecond),
+			FirstEventP50Ms:    float64(res.FirstEvent.P50) / float64(time.Millisecond),
+			FirstEventP90Ms:    float64(res.FirstEvent.P90) / float64(time.Millisecond),
+			FirstEventP99Ms:    float64(res.FirstEvent.P99) / float64(time.Millisecond),
+			FirstEventMaxMs:    float64(res.FirstEvent.Max) / float64(time.Millisecond),
 		}
 	}
 
@@ -800,4 +966,106 @@ func saveResults(results []BenchmarkResult, outputFile string) {
 	}
 
 	fmt.Printf("Results saved to %s\n", outputFile)
+}
+
+// roundRobinTransport spreads requests over several transports, each holding its own HTTP/2 connection
+type roundRobinTransport struct {
+	transports []http.RoundTripper
+	next       atomic.Uint64
+}
+
+func (r *roundRobinTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	i := r.next.Add(1) - 1
+	return r.transports[i%uint64(len(r.transports))].RoundTrip(req)
+}
+
+func responseComplete(provider Provider, body []byte) bool {
+	if provider.RequestType != "chat" {
+		return true
+	}
+	if !provider.Stream {
+		return json.Valid(body)
+	}
+	if provider.Dialect == "anthropic" {
+		return bytes.Contains(body, []byte(`"type":"message_stop"`))
+	}
+	return bytes.Contains(body, []byte("[DONE]"))
+}
+
+type firstEventRecorder struct {
+	active    atomic.Bool
+	mutex     sync.Mutex
+	durations []time.Duration
+}
+
+func (r *firstEventRecorder) add(d time.Duration) {
+	r.mutex.Lock()
+	r.durations = append(r.durations, d)
+	r.mutex.Unlock()
+}
+
+func (r *firstEventRecorder) summary() LatencySummary {
+	r.mutex.Lock()
+	durations := append([]time.Duration(nil), r.durations...)
+	r.mutex.Unlock()
+	if len(durations) == 0 {
+		return LatencySummary{}
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	var total time.Duration
+	for _, d := range durations {
+		total += d
+	}
+	at := func(q float64) time.Duration {
+		return durations[min(len(durations)-1, int(q*float64(len(durations))))]
+	}
+	return LatencySummary{
+		Count: len(durations),
+		Mean:  total / time.Duration(len(durations)),
+		P50:   at(0.50),
+		P90:   at(0.90),
+		P99:   at(0.99),
+		Max:   durations[len(durations)-1],
+	}
+}
+
+type firstEventTransport struct {
+	next     http.RoundTripper
+	recorder *firstEventRecorder
+}
+
+func (t *firstEventTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	measured := t.recorder.active.Load()
+	start := time.Now()
+	resp, err := t.next.RoundTrip(req)
+	if err != nil || !measured {
+		return resp, err
+	}
+	resp.Body = &firstEventBody{ReadCloser: resp.Body, start: start, recorder: t.recorder}
+	return resp, nil
+}
+
+var sseDataPrefix = []byte("data:")
+
+type firstEventBody struct {
+	io.ReadCloser
+	start    time.Time
+	recorder *firstEventRecorder
+	seen     bool
+	tail     []byte
+}
+
+func (b *firstEventBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if !b.seen && n > 0 {
+		window := append(b.tail, p[:n]...)
+		if bytes.Contains(window, sseDataPrefix) {
+			b.seen = true
+			b.tail = nil
+			b.recorder.add(time.Since(b.start))
+		} else {
+			b.tail = append([]byte(nil), window[max(0, len(window)-len(sseDataPrefix)+1):]...)
+		}
+	}
+	return n, err
 }

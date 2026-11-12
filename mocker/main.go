@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -323,6 +326,7 @@ var (
 	modelsList         string
 	systemOneTier      string
 	logRaw             bool
+	h2c                bool
 	rateLimitedKeys    string
 	rateLimitedKeyMap  map[string]bool
 	startTime          time.Time
@@ -423,6 +427,7 @@ func init() {
 	flag.StringVar(&modelsList, "models", getEnvString("MOCKER_MODELS", "gpt-4o-mini,gpt-4o,claude-3-5-sonnet-latest,gemini-2.0-flash"), "Comma-separated model ids returned by GET /v1/models")
 	flag.StringVar(&systemOneTier, "systemone-tier", getEnvString("MOCKER_SYSTEMONE_TIER", "SIMPLE"), "Fixed Jev complexity tier returned by POST /v1/systemone (SIMPLE, MEDIUM, or COMPLEX)")
 	flag.BoolVar(&logRaw, "log-raw", getEnvBool("MOCKER_LOG_RAW", false), "Log raw request and response bodies")
+	flag.BoolVar(&h2c, "h2c", getEnvBool("MOCKER_H2C", false), "Serve HTTP/2 cleartext (prior knowledge) as well as HTTP/1.1, via net/http instead of fasthttp")
 	flag.StringVar(&rateLimitedKeys, "rate-limited-keys", getEnvString("MOCKER_RATE_LIMITED_KEYS", ""), "Comma-separated list of Authorization header values that always receive 429 (e.g. 'Bearer key-1,Bearer key-2')")
 	flag.StringVar(&latencySpikeKeys, "latency-spike-keys", getEnvString("MOCKER_LATENCY_SPIKE_KEYS", ""), "Per-key sparse latency spikes as key=pct:mult (e.g. 'slow-key=10:5' → 10% of requests get 5x latency). Tests outlier rejection.")
 	flag.StringVar(&latencyRampKeys, "latency-ramp-keys", getEnvString("MOCKER_LATENCY_RAMP_KEYS", ""), "Per-key linear base-latency drift in ms added per minute elapsed (e.g. 'slow-key=2000'). Tests gradual-drift tracking.")
@@ -1329,12 +1334,88 @@ func sendAnthropicStreamingResponse(ctx *fasthttp.RequestCtx, model string, mock
 		}); err != nil {
 			return
 		}
-		if err := writeSSEJSON(w, "message_stop", map[string]any{
+		_ = writeSSEJSON(w, "message_stop", map[string]any{
 			"type": "message_stop",
-		}); err != nil {
+		})
+	})
+}
+
+func sendResponsesStreamingResponse(ctx *fasthttp.RequestCtx, model string, mockContent string) {
+	setSSEHeaders(ctx)
+	tokens := buildStreamChunks(getStreamWords(mockContent))
+	gaps := len(tokens) - 1
+	totalLatency := getStreamTotalLatency(string(ctx.Request.Header.Peek("Authorization")))
+	inputTokens := resolveInputTokens(rand.Intn(1000))
+	outputTokens := resolveOutputTokens(len(getStreamWords(mockContent)))
+
+	ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+		const responseID = "resp-mock12345"
+		const itemID = "msg_mock12345"
+		created := int(time.Now().Unix())
+		seq := 0
+		emit := func(eventType string, fields map[string]any) error {
+			fields["type"] = eventType
+			fields["sequence_number"] = seq
+			seq++
+			return writeSSEJSON(w, eventType, fields)
+		}
+		response := func(status string, output []any, usage any) map[string]any {
+			r := map[string]any{
+				"id":         responseID,
+				"object":     "response",
+				"created_at": created,
+				"status":     status,
+				"model":      model,
+				"output":     output,
+			}
+			if usage != nil {
+				r["usage"] = usage
+			}
+			return r
+		}
+		textPart := func(text string) map[string]any {
+			return map[string]any{"type": "output_text", "text": text, "annotations": []any{}}
+		}
+		message := func(status string, content []any) map[string]any {
+			return map[string]any{"id": itemID, "type": "message", "status": status, "role": "assistant", "content": content}
+		}
+
+		if err := emit("response.created", map[string]any{"response": response("in_progress", []any{}, nil)}); err != nil {
 			return
 		}
-		_ = writeSSEDataLine(w, "[DONE]")
+		if err := emit("response.output_item.added", map[string]any{"output_index": 0, "item": message("in_progress", []any{})}); err != nil {
+			return
+		}
+		if err := emit("response.content_part.added", map[string]any{"item_id": itemID, "output_index": 0, "content_index": 0, "part": textPart("")}); err != nil {
+			return
+		}
+
+		start := time.Now()
+		for i, token := range tokens {
+			if err := emit("response.output_text.delta", map[string]any{"item_id": itemID, "output_index": 0, "content_index": 0, "delta": token}); err != nil {
+				return
+			}
+			if i < gaps {
+				sleepUntilStreamDeadline(start, totalLatency, i, gaps)
+			}
+		}
+
+		text := strings.Join(tokens, "")
+		if err := emit("response.output_text.done", map[string]any{"item_id": itemID, "output_index": 0, "content_index": 0, "text": text}); err != nil {
+			return
+		}
+		if err := emit("response.content_part.done", map[string]any{"item_id": itemID, "output_index": 0, "content_index": 0, "part": textPart(text)}); err != nil {
+			return
+		}
+		done := message("completed", []any{textPart(text)})
+		if err := emit("response.output_item.done", map[string]any{"output_index": 0, "item": done}); err != nil {
+			return
+		}
+		_ = emit("response.completed", map[string]any{"response": response("completed", []any{done}, map[string]any{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+			"total_tokens":  inputTokens + outputTokens,
+		})})
 	})
 }
 
@@ -1534,7 +1615,7 @@ func mockResponsesHandler(ctx *fasthttp.RequestCtx) {
 	if !checkAuth(ctx) || !checkMethod(ctx) {
 		return
 	}
-	provider, model, _ := parseModelFromRequest(ctx)
+	provider, model, stream := parseModelFromRequest(ctx)
 
 	if isKeyRateLimited(ctx) || shouldTriggerTPM(string(ctx.Request.Header.Peek("Authorization"))) {
 		sendRateLimitResponse(ctx)
@@ -1549,15 +1630,22 @@ func mockResponsesHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	if provider != "" {
-		log.Printf("[responses] provider=%s model=%s", provider, model)
-	} else {
-		log.Printf("[responses] model=%s", model)
+	if logRaw {
+		if provider != "" {
+			log.Printf("[responses] provider=%s model=%s stream=%v", provider, model, stream)
+		} else {
+			log.Printf("[responses] model=%s stream=%v", model, stream)
+		}
+	}
+
+	mockContent := mockTextContent("This is a mocked response from the OpenAI mocker server.")
+
+	if stream {
+		sendResponsesStreamingResponse(ctx, model, mockContent)
+		return
 	}
 
 	simulateLatency(string(ctx.Request.Header.Peek("Authorization")))
-
-	mockContent := mockTextContent("This is a mocked response from the OpenAI mocker server.")
 
 	randomInputTokens := resolveInputTokens(rand.Intn(1000))
 	randomOutputTokens := resolveOutputTokens(mockOutputTokenCount(mockContent, rand.Intn(1000)))
@@ -1688,10 +1776,12 @@ func mockAnthropicMessagesHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	if provider != "" {
-		log.Printf("[anthropic/messages] provider=%s model=%s stream=%v", provider, model, stream)
-	} else {
-		log.Printf("[anthropic/messages] model=%s stream=%v", model, stream)
+	if logRaw {
+		if provider != "" {
+			log.Printf("[anthropic/messages] provider=%s model=%s stream=%v", provider, model, stream)
+		} else {
+			log.Printf("[anthropic/messages] model=%s stream=%v", model, stream)
+		}
 	}
 
 	mockContent := mockTextContent("This is a mocked response from the Bifrost mocker server.")
@@ -2110,10 +2200,14 @@ func main() {
 	})
 
 	addr := fmt.Sprintf("%s:%d", host, port)
+	serverKind := "fasthttp"
+	if h2c {
+		serverKind = "net/http, h2c"
+	}
 	if jitter > 0 {
-		log.Printf("Mock LLM server (fasthttp) starting on %s with latency %dms ±%dms jitter...\n", addr, latency, jitter)
+		log.Printf("Mock LLM server (%s) starting on %s with latency %dms ±%dms jitter...\n", serverKind, addr, latency, jitter)
 	} else {
-		log.Printf("Mock LLM server (fasthttp) starting on %s with latency %dms...\n", addr, latency)
+		log.Printf("Mock LLM server (%s) starting on %s with latency %dms...\n", serverKind, addr, latency)
 	}
 	if latencyAuthKeys != "" {
 		log.Printf("Latency will only apply to requests with auth keys: %s", latencyAuthKeys)
@@ -2139,6 +2233,11 @@ func main() {
 	}
 	log.Printf("Max request body size: 50MB")
 
+	if h2c {
+		serveH2C(addr)
+		return
+	}
+
 	// Create fasthttp server with 50MB max request body size
 	server := &fasthttp.Server{
 		Handler:            router,
@@ -2152,4 +2251,68 @@ func main() {
 	if err := server.ListenAndServe(addr); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
+}
+
+func serveH2C(addr string) {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+
+	server := &http.Server{
+		Addr:         addr,
+		Protocols:    protocols,
+		HTTP2:        &http.HTTP2Config{MaxConcurrentStreams: 1 << 20},
+		Handler:      http.HandlerFunc(serveFastHTTP),
+		ReadTimeout:  300 * time.Second,
+		WriteTimeout: 300 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+func serveFastHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 50*1024*1024))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req fasthttp.Request
+	req.Header.SetMethod(r.Method)
+	req.SetRequestURI(r.URL.RequestURI())
+	req.Header.SetHost(r.Host)
+	for name, values := range r.Header {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
+	req.SetBody(body)
+
+	var ctx fasthttp.RequestCtx
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", r.RemoteAddr)
+	ctx.Init(&req, remoteAddr, nil)
+	router(&ctx)
+
+	ctx.Response.Header.VisitAll(func(name, value []byte) {
+		w.Header().Add(string(name), string(value))
+	})
+	w.Header().Del("Content-Length")
+	w.WriteHeader(ctx.Response.StatusCode())
+	ctx.Response.BodyWriteTo(flushWriter{w, http.NewResponseController(w)})
+}
+
+type flushWriter struct {
+	w  http.ResponseWriter
+	rc *http.ResponseController
+}
+
+func (f flushWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if err == nil {
+		err = f.rc.Flush()
+	}
+	return n, err
 }
