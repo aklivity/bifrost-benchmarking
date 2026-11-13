@@ -147,16 +147,23 @@ Each run writes per-provider metrics to the output file:
     "success_rate": 99.8,
     "mean_latency_ms": 45.2,
     "p50_latency_ms": 42.1,
+    "p95_latency_ms": 98.3,
     "p99_latency_ms": 156.7,
     "max_latency_ms": 203.4,
     "throughput_rps": 498.5,
     "status_code_counts": { "200": 4990, "500": 10 },
     "server_peak_memory_mb": 256.7,
     "server_avg_memory_mb": 189.3,
-    "drop_reasons": { "HTTP 500": 10 }
+    "drop_reasons": { "HTTP 500": 10 },
+    "latency_histogram": [
+      { "from_ms": 40.96, "to_ms": 40.964, "count": 12 },
+      { "from_ms": 40.964, "to_ms": 40.968, "count": 9 }
+    ]
   }
 }
 ```
+
+The percentiles and max come from a latency histogram of the measured window only; warm-up requests are left out. `latency_histogram` lists its non-empty buckets so the full distribution can be plotted. Buckets are 1 µs wide below 16 ms and keep about 0.01% relative width above that (128 µs at 1.5 s).
 
 Memory stats come from sampling the RSS of the process listening on the provider's configured port, so run the tool on the same machine as the gateways (or expect empty memory stats).
 

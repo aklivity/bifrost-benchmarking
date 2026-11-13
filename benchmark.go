@@ -56,6 +56,7 @@ type BenchmarkResult struct {
 	InputTokens       int             // Estimated input tokens per request
 	MaxOutputTokens   int             // Requested max output tokens per chat request
 	FirstEvent        LatencySummary  // Time to the first SSE data event, for streamed requests in the measured window
+	Latency           *latencyHistogram
 }
 
 type LatencySummary struct {
@@ -503,6 +504,7 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 
 		// Initialize drop reasons tracking
 		dropReasons := make(map[string]int)
+		latencies := newLatencyHistogram()
 
 		// Start server memory monitoring (only for localhost providers with a port)
 		if provider.Port != "" {
@@ -557,6 +559,7 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 			// Count status codes and failures
 			statusCodes := make(map[string]int)
 			for _, result := range concurrentMetrics.Results {
+				latencies.Record(result.Latency)
 				if result.Success {
 					statusCodes["200"]++
 				} else if result.StatusCode > 0 {
@@ -588,6 +591,7 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 				}
 				res.Body = nil
 				metrics.Add(res)
+				latencies.Record(res.Latency)
 
 				// Track drop reasons
 				if res.Error != "" {
@@ -633,6 +637,7 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 			InputTokens:       provider.InputTokens,
 			MaxOutputTokens:   provider.MaxOutputTokens,
 			FirstEvent:        firstEvents.summary(),
+			Latency:           latencies,
 		})
 
 		fmt.Println(metrics.StatusCodes) // Print status code distribution to console
@@ -647,9 +652,11 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 		fmt.Printf("  Request Rate: %.2f/s\n", metrics.Rate)
 		fmt.Printf("  Success Rate: %.2f%%\n", 100.0*metrics.Success)
 		fmt.Printf("  Mean Latency: %s\n", metrics.Latencies.Mean)
-		fmt.Printf("  P50 Latency: %s\n", metrics.Latencies.P50)
-		fmt.Printf("  P99 Latency: %s\n", metrics.Latencies.P99)
-		fmt.Printf("  Max Latency: %s\n", metrics.Latencies.Max)
+		fmt.Printf("  Latency Histogram: %d requests\n", latencies.Count())
+		fmt.Printf("  P50 Latency: %s\n", latencies.Quantile(0.50))
+		fmt.Printf("  P95 Latency: %s\n", latencies.Quantile(0.95))
+		fmt.Printf("  P99 Latency: %s\n", latencies.Quantile(0.99))
+		fmt.Printf("  Max Latency: %s\n", latencies.Max())
 		fmt.Printf("  Throughput: %.2f/s\n", metrics.Throughput)
 		if provider.Stream {
 			fe := firstEvents.summary()
@@ -866,27 +873,29 @@ func createConcurrentTargeter(provider Provider) func() (concurrent.Request, err
 // and memory values to megabytes for the output.
 func saveResults(results []BenchmarkResult, outputFile string) {
 	type SerializableResult struct {
-		Requests           uint64         `json:"requests"`
-		Rate               float64        `json:"rate"`
-		SuccessRate        float64        `json:"success_rate"`
-		MeanLatencyMs      float64        `json:"mean_latency_ms"`
-		P50LatencyMs       float64        `json:"p50_latency_ms"`
-		P99LatencyMs       float64        `json:"p99_latency_ms"`
-		MaxLatencyMs       float64        `json:"max_latency_ms"`
-		ThroughputRPS      float64        `json:"throughput_rps"`
-		Timestamp          string         `json:"timestamp"`
-		StatusCodeCounts   map[string]int `json:"status_code_counts"`
-		ServerPeakMemoryMB float64        `json:"server_peak_memory_mb"` // Peak server RSS memory during benchmark
-		ServerAvgMemoryMB  float64        `json:"server_avg_memory_mb"`  // Average server RSS memory during benchmark
-		DropReasons        map[string]int `json:"drop_reasons"`          // Counts of reasons for dropped/failed requests
-		InputTokens        int            `json:"input_tokens"`          // Estimated input tokens per request
-		MaxOutputTokens    int            `json:"max_output_tokens"`     // Requested max output tokens per chat request
-		FirstEventCount    int            `json:"first_event_count,omitempty"`
-		FirstEventMeanMs   float64        `json:"first_event_mean_ms,omitempty"`
-		FirstEventP50Ms    float64        `json:"first_event_p50_ms,omitempty"`
-		FirstEventP90Ms    float64        `json:"first_event_p90_ms,omitempty"`
-		FirstEventP99Ms    float64        `json:"first_event_p99_ms,omitempty"`
-		FirstEventMaxMs    float64        `json:"first_event_max_ms,omitempty"`
+		Requests           uint64            `json:"requests"`
+		Rate               float64           `json:"rate"`
+		SuccessRate        float64           `json:"success_rate"`
+		MeanLatencyMs      float64           `json:"mean_latency_ms"`
+		P50LatencyMs       float64           `json:"p50_latency_ms"`
+		P95LatencyMs       float64           `json:"p95_latency_ms"`
+		P99LatencyMs       float64           `json:"p99_latency_ms"`
+		MaxLatencyMs       float64           `json:"max_latency_ms"`
+		ThroughputRPS      float64           `json:"throughput_rps"`
+		Timestamp          string            `json:"timestamp"`
+		StatusCodeCounts   map[string]int    `json:"status_code_counts"`
+		ServerPeakMemoryMB float64           `json:"server_peak_memory_mb"` // Peak server RSS memory during benchmark
+		ServerAvgMemoryMB  float64           `json:"server_avg_memory_mb"`  // Average server RSS memory during benchmark
+		DropReasons        map[string]int    `json:"drop_reasons"`          // Counts of reasons for dropped/failed requests
+		InputTokens        int               `json:"input_tokens"`          // Estimated input tokens per request
+		MaxOutputTokens    int               `json:"max_output_tokens"`     // Requested max output tokens per chat request
+		FirstEventCount    int               `json:"first_event_count,omitempty"`
+		FirstEventMeanMs   float64           `json:"first_event_mean_ms,omitempty"`
+		FirstEventP50Ms    float64           `json:"first_event_p50_ms,omitempty"`
+		FirstEventP90Ms    float64           `json:"first_event_p90_ms,omitempty"`
+		FirstEventP99Ms    float64           `json:"first_event_p99_ms,omitempty"`
+		FirstEventMaxMs    float64           `json:"first_event_max_ms,omitempty"`
+		LatencyHistogram   []HistogramBucket `json:"latency_histogram,omitempty"`
 	}
 
 	// Create a map with provider names as keys
@@ -933,9 +942,10 @@ func saveResults(results []BenchmarkResult, outputFile string) {
 			Rate:               res.Metrics.Rate,
 			SuccessRate:        100.0 * res.Metrics.Success,
 			MeanLatencyMs:      float64(res.Metrics.Latencies.Mean) / float64(time.Millisecond),
-			P50LatencyMs:       float64(res.Metrics.Latencies.P50) / float64(time.Millisecond),
-			P99LatencyMs:       float64(res.Metrics.Latencies.P99) / float64(time.Millisecond),
-			MaxLatencyMs:       float64(res.Metrics.Latencies.Max) / float64(time.Millisecond),
+			P50LatencyMs:       float64(res.Latency.Quantile(0.50)) / float64(time.Millisecond),
+			P95LatencyMs:       float64(res.Latency.Quantile(0.95)) / float64(time.Millisecond),
+			P99LatencyMs:       float64(res.Latency.Quantile(0.99)) / float64(time.Millisecond),
+			MaxLatencyMs:       float64(res.Latency.Max()) / float64(time.Millisecond),
 			ThroughputRPS:      res.Metrics.Throughput,
 			Timestamp:          time.Now().Format(time.RFC3339),
 			StatusCodeCounts:   statusCodes,
@@ -950,6 +960,7 @@ func saveResults(results []BenchmarkResult, outputFile string) {
 			FirstEventP90Ms:    float64(res.FirstEvent.P90) / float64(time.Millisecond),
 			FirstEventP99Ms:    float64(res.FirstEvent.P99) / float64(time.Millisecond),
 			FirstEventMaxMs:    float64(res.FirstEvent.Max) / float64(time.Millisecond),
+			LatencyHistogram:   res.Latency.Buckets(),
 		}
 	}
 
