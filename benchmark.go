@@ -56,7 +56,7 @@ type BenchmarkResult struct {
 	InputTokens       int             // Estimated input tokens per request
 	MaxOutputTokens   int             // Requested max output tokens per chat request
 	FirstEvent        LatencySummary  // Time to the first SSE data event, for streamed requests in the measured window
-	Latency           *latencyHistogram
+	Latency           *LatencyHistogram
 }
 
 type LatencySummary struct {
@@ -504,7 +504,7 @@ func runBenchmarks(providers []Provider, rate int, users int, duration int, time
 
 		// Initialize drop reasons tracking
 		dropReasons := make(map[string]int)
-		latencies := newLatencyHistogram()
+		latencies := NewLatencyHistogram()
 
 		// Start server memory monitoring (only for localhost providers with a port)
 		if provider.Port != "" {

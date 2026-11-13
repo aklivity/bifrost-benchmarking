@@ -6,7 +6,7 @@ import (
 )
 
 func TestLatencyHistogramQuantiles(t *testing.T) {
-	h := newLatencyHistogram()
+	h := NewLatencyHistogram()
 	for i := 1; i <= 10000; i++ {
 		h.Record(1500*time.Millisecond + time.Duration(i)*10*time.Microsecond)
 	}
@@ -33,7 +33,7 @@ func TestLatencyHistogramQuantiles(t *testing.T) {
 }
 
 func TestLatencyHistogramBucketsCoverEveryRecord(t *testing.T) {
-	h := newLatencyHistogram()
+	h := NewLatencyHistogram()
 	values := []time.Duration{0, 999 * time.Microsecond, 1501 * time.Millisecond, 1501 * time.Millisecond, 19 * time.Second}
 	for _, v := range values {
 		h.Record(v)
@@ -69,7 +69,7 @@ func TestLatencyHistogramBucketsCoverEveryRecord(t *testing.T) {
 }
 
 func TestLatencyHistogramEmpty(t *testing.T) {
-	h := newLatencyHistogram()
+	h := NewLatencyHistogram()
 	if h.Quantile(0.99) != 0 || h.Max() != 0 || h.Mean() != 0 || len(h.Buckets()) != 0 {
 		t.Fatal("empty histogram should report zeros and no buckets")
 	}

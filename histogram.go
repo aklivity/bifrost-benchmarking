@@ -9,7 +9,7 @@ import (
 
 const histogramSubBucketBits = 14
 
-type latencyHistogram struct {
+type LatencyHistogram struct {
 	counts map[uint64]uint64
 	total  uint64
 	sum    time.Duration
@@ -22,8 +22,8 @@ type HistogramBucket struct {
 	Count  uint64  `json:"count"`
 }
 
-func newLatencyHistogram() *latencyHistogram {
-	return &latencyHistogram{counts: make(map[uint64]uint64)}
+func NewLatencyHistogram() *LatencyHistogram {
+	return &LatencyHistogram{counts: make(map[uint64]uint64)}
 }
 
 func histogramBucketWidth(us uint64) uint64 {
@@ -34,7 +34,7 @@ func histogramBucketWidth(us uint64) uint64 {
 	return 1 << shift
 }
 
-func (h *latencyHistogram) Record(d time.Duration) {
+func (h *LatencyHistogram) Record(d time.Duration) {
 	if d < 0 {
 		d = 0
 	}
@@ -48,22 +48,22 @@ func (h *latencyHistogram) Record(d time.Duration) {
 	}
 }
 
-func (h *latencyHistogram) Count() uint64 {
+func (h *LatencyHistogram) Count() uint64 {
 	return h.total
 }
 
-func (h *latencyHistogram) Max() time.Duration {
+func (h *LatencyHistogram) Max() time.Duration {
 	return h.max
 }
 
-func (h *latencyHistogram) Mean() time.Duration {
+func (h *LatencyHistogram) Mean() time.Duration {
 	if h.total == 0 {
 		return 0
 	}
 	return h.sum / time.Duration(h.total)
 }
 
-func (h *latencyHistogram) sortedStarts() []uint64 {
+func (h *LatencyHistogram) sortedStarts() []uint64 {
 	starts := make([]uint64, 0, len(h.counts))
 	for start := range h.counts {
 		starts = append(starts, start)
@@ -72,7 +72,7 @@ func (h *latencyHistogram) sortedStarts() []uint64 {
 	return starts
 }
 
-func (h *latencyHistogram) Quantile(q float64) time.Duration {
+func (h *LatencyHistogram) Quantile(q float64) time.Duration {
 	if h.total == 0 {
 		return 0
 	}
@@ -91,7 +91,7 @@ func (h *latencyHistogram) Quantile(q float64) time.Duration {
 	return h.max
 }
 
-func (h *latencyHistogram) Buckets() []HistogramBucket {
+func (h *LatencyHistogram) Buckets() []HistogramBucket {
 	starts := h.sortedStarts()
 	buckets := make([]HistogramBucket, 0, len(starts))
 	for _, start := range starts {
